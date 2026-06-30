@@ -111,7 +111,7 @@ async function findRecentOrders(phone, email, currentOrderId) {
 
 async function cancelOrder(orderId, reason) {
   await shopifyAPI(`orders/${orderId}.json`, "PUT", { order: { id: orderId, note: reason } });
-  const result = await shopifyAPI(`orders/${orderId}/cancel.json`, "POST", { reason: "other", email: false, restock: true });
+  const result = await shopifyAPI(`orders/${orderId}/cancel.json`, "POST", { reason: "other", email: false, restock: true, refund: true });
   console.log(`Cancelled order ${orderId}:`, JSON.stringify(result).substring(0, 200));
 }
 
