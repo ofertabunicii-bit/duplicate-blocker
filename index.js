@@ -4,9 +4,9 @@ const crypto = require("crypto");
 const app = express();
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────
-const SHOPIFY_STORE = process.env.SHOPIFY_STORE; // ex: mystore.myshopify.com
-const SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN; // Admin API token
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET; // Webhook signing secret
+const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
+const SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const HOURS_LIMIT = parseInt(process.env.HOURS_LIMIT || "72");
 const PORT = process.env.PORT || 3000;
 // ────────────────────────────────────────────────────────────────────────────
@@ -24,18 +24,17 @@ function verifyWebhook(req) {
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac));
 }
 
-// ── Shopify API helper ───────────────────────────────────────────────────────
-async function shopifyAPI(path, method = "GET", body = null) {
-  const url = `https://${SHOPIFY_STORE}/admin/api/2026-04/${path}`;
-  const opts = {
-    method,
+// ── Shopify GraphQL helper ───────────────────────────────────────────────────
+async function shopifyGraphQL(query, variables = {}) {
+  const url = `https://${SHOPIFY_STORE}/admin/api/2026-04/graphql.json`;
+  const res = await fetch(url, {
+    method: "POST",
     headers: {
       "X-Shopify-Access-Token": SHOPIFY_TOKEN,
       "Content-Type": "application/json",
     },
-  };
-  if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(url, opts);
+    body: JSON.stringify({ query, variables }),
+  });
   return res.json();
 }
 
@@ -44,30 +43,41 @@ async function findRecentOrders(phone, email, currentOrderId) {
   const since = new Date(Date.now() - HOURS_LIMIT * 60 * 60 * 1000).toISOString();
   const found = [];
 
-  // Search by phone
-  if (phone) {
-    const cleaned = phone.replace(/\s+/g, "").replace(/[^\d+]/g, "");
-    const data = await shopifyAPI(
-      `orders.json?status=any&created_at_min=${since}&fields=id,name,phone,email,created_at`
-    );
-    if (data.orders) {
-      for (const o of data.orders) {
-        if (String(o.id) === String(currentOrderId)) continue;
-        const oPhone = (o.phone || "").replace(/\s+/g, "").replace(/[^\d+]/g, "");
-        if (oPhone && oPhone === cleaned) found.push(o);
+  const cleanPhone = phone ? phone.replace(/\s+/g, "").replace(/[^\d+]/g, "") : "";
+
+  let queryStr = `created_at:>='${since}'`;
+  if (cleanPhone) queryStr += ` phone:${cleanPhone}`;
+  else if (email) queryStr += ` email:${email}`;
+
+  const gql = `
+    query($q: String!) {
+      orders(first: 20, query: $q) {
+        edges {
+          node {
+            id
+            name
+            phone
+            email
+            createdAt
+          }
+        }
       }
     }
-  }
+  `;
 
-  // Search by email (if not already found by phone)
-  if (email && found.length === 0) {
-    const data = await shopifyAPI(
-      `orders.json?status=any&created_at_min=${since}&email=${encodeURIComponent(email)}&fields=id,name,phone,email,created_at`
-    );
-    if (data.orders) {
-      for (const o of data.orders) {
-        if (String(o.id) === String(currentOrderId)) continue;
-        found.push(o);
+  const data = await shopifyGraphQL(gql, { q: queryStr });
+  console.log("GraphQL response:", JSON.stringify(data).substring(0, 500));
+
+  if (data?.data?.orders?.edges) {
+    for (const { node } of data.data.orders.edges) {
+      const nodeId = node.id.split("/").pop();
+      if (String(nodeId) === String(currentOrderId)) continue;
+
+      if (cleanPhone) {
+        const oPhone = (node.phone || "").replace(/\s+/g, "").replace(/[^\d+]/g, "");
+        if (oPhone && oPhone === cleanPhone) found.push(node);
+      } else if (email && node.email === email) {
+        found.push(node);
       }
     }
   }
@@ -77,34 +87,40 @@ async function findRecentOrders(phone, email, currentOrderId) {
 
 // ── Cancel an order ──────────────────────────────────────────────────────────
 async function cancelOrder(orderId, reason) {
-  // Add a note first
-  await shopifyAPI(`orders/${orderId}.json`, "PUT", {
-    order: {
-      id: orderId,
-      note: reason,
-    },
-  });
+  const gql = `
+    mutation cancelOrder($orderId: ID!, $reason: OrderCancelReason!, $notifyCustomer: Boolean!, $refund: Boolean!, $restock: Boolean!) {
+      orderCancel(orderId: $orderId, reason: $reason, notifyCustomer: $notifyCustomer, refund: $refund, restock: $restock) {
+        job {
+          id
+        }
+        orderCancelUserErrors {
+          message
+        }
+      }
+    }
+  `;
 
-  // Cancel the order
-  await shopifyAPI(`orders/${orderId}/cancel.json`, "POST", {
-    reason: "other",
-    note: reason,
-    email: false, // Don't send cancellation email (change to true if you want)
+  const gid = `gid://shopify/Order/${orderId}`;
+  const result = await shopifyGraphQL(gql, {
+    orderId: gid,
+    reason: "OTHER",
+    notifyCustomer: false,
+    refund: false,
     restock: true,
   });
 
+  console.log("Cancel result:", JSON.stringify(result).substring(0, 300));
   console.log(`[${new Date().toISOString()}] Cancelled order ${orderId}: ${reason}`);
 }
 
 // ── Webhook endpoint ─────────────────────────────────────────────────────────
 app.post("/webhook/orders/create", async (req, res) => {
-  // Verify it's really from Shopify
   if (!verifyWebhook(req)) {
     console.warn("Invalid webhook signature");
     return res.status(401).send("Unauthorized");
   }
 
-  res.status(200).send("OK"); // Respond immediately to Shopify
+  res.status(200).send("OK");
 
   const order = req.body;
   const orderId = order.id;
@@ -119,7 +135,7 @@ app.post("/webhook/orders/create", async (req, res) => {
 
     if (duplicates.length > 0) {
       const dupNames = duplicates.map((o) => o.name).join(", ");
-      const reason = `Comandă duplicată anulată automat. Comandă anterioară în ultimele ${HOURS_LIMIT}h: ${dupNames}`;
+      const reason = `Comanda duplicata anulata automat. Comanda anterioara in ultimele ${HOURS_LIMIT}h: ${dupNames}`;
       console.log(`Duplicate found for order ${orderName}: ${dupNames}`);
       await cancelOrder(orderId, reason);
     } else {
