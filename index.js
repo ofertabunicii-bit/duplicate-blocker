@@ -189,3 +189,71 @@ app.listen(PORT, () => {
   console.log(`Store: ${SHOPIFY_STORE}`);
   console.log(`Blocking duplicates within: ${HOURS_LIMIT} hours`);
 });
+
+// ── Endpoint fix retroactiv - acceseaza o singura data din browser ────────────
+app.get("/fix-cancelled-today", async (req, res) => {
+  const secret = req.query.secret;
+  if (secret !== "bunero2026fix") return res.status(401).send("Unauthorized");
+
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.write("Incep zerorizarea comenzilor anulate de azi...\n\n");
+
+  try {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const since = today.toISOString();
+
+    let url = `https://${SHOPIFY_STORE}/admin/api/2026-04/orders.json?status=cancelled&created_at_min=${since}&limit=250&fields=id,name,total_price,line_items,shipping_lines`;
+    const allOrders = [];
+
+    while (url) {
+      const r = await fetch(url, { headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN } });
+      const json = await r.json();
+      if (json.orders) allOrders.push(...json.orders);
+      const link = r.headers.get("link") || "";
+      const next = link.match(/<([^>]+)>;\s*rel="next"/);
+      url = next ? next[1] : null;
+    }
+
+    const toFix = allOrders.filter(o => parseFloat(o.total_price) > 0);
+    res.write(`Gasit ${allOrders.length} comenzi anulate, ${toFix.length} cu suma > 0\n\n`);
+
+    for (const order of toFix) {
+      try {
+        const refundLineItems = order.line_items
+          .filter(item => item.quantity > 0)
+          .map(item => ({ line_item_id: item.id, quantity: item.quantity, restock_type: "no_restock" }));
+
+        if (refundLineItems.length === 0) {
+          res.write(`- ${order.name}: deja 0, skip\n`);
+          continue;
+        }
+
+        const refundPayload = {
+          refund: {
+            notify: false,
+            note: "Zerorizare retroactiva",
+            refund_line_items: refundLineItems,
+            ...(order.shipping_lines?.length > 0 && { shipping: { full_refund: true } })
+          }
+        };
+
+        const result = await shopifyAPI(`orders/${order.id}/refunds.json`, "POST", refundPayload);
+        if (result.refund) {
+          res.write(`✓ ${order.name} zerorizat (${order.total_price} lei)\n`);
+        } else {
+          res.write(`✗ ${order.name} eroare: ${JSON.stringify(result).substring(0, 100)}\n`);
+        }
+        await new Promise(r => setTimeout(r, 300));
+      } catch (err) {
+        res.write(`✗ ${order.name} eroare: ${err.message}\n`);
+      }
+    }
+
+    res.write("\nGata!");
+    res.end();
+  } catch (err) {
+    res.write("Eroare generala: " + err.message);
+    res.end();
+  }
+});
