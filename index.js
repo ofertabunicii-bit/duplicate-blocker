@@ -113,33 +113,46 @@ async function cancelOrder(orderId, reason) {
   // Adauga nota
   await shopifyAPI(`orders/${orderId}.json`, "PUT", { order: { id: orderId, note: reason } });
 
-  // Editeaza comanda sa scoata produsele (Total = 0)
-  try {
-    const editStart = await shopifyAPI(`orders/${orderId}/edits.json`, "POST", {});
-    const calculatedOrderId = editStart?.calculated_order?.id;
-    if (calculatedOrderId) {
-      // Obtine linia items din comanda originala
-      const orderData = await shopifyAPI(`orders/${orderId}.json`);
-      const lineItems = orderData?.order?.line_items || [];
-      for (const item of lineItems) {
-        await shopifyAPI(`orders/${orderId}/edits/${calculatedOrderId}/line_items/${item.id}.json`, "DELETE", null);
-      }
-      await shopifyAPI(`orders/${orderId}/edits/${calculatedOrderId}/commit.json`, "POST", {
-        notify_customer: false,
-        reason: reason
-      });
-    }
-  } catch (editErr) {
-    console.log("Edit order failed (non-critical):", editErr.message);
-  }
+  // Obtine detaliile comenzii pentru refund
+  const orderData = await shopifyAPI(`orders/${orderId}.json`);
+  const order = orderData?.order;
 
-  // Anuleaza comanda
-  const result = await shopifyAPI(`orders/${orderId}/cancel.json`, "POST", { 
+  // Anuleaza comanda cu restock
+  await shopifyAPI(`orders/${orderId}/cancel.json`, "POST", { 
     reason: "other", 
     email: false, 
     restock: true
   });
-  console.log(`Cancelled order ${orderId}:`, JSON.stringify(result).substring(0, 200));
+
+  // Daca comanda are line items, face refund pentru a zeriza suma
+  if (order?.line_items?.length > 0) {
+    try {
+      const refundLineItems = order.line_items.map(item => ({
+        line_item_id: item.id,
+        quantity: item.quantity,
+        restock_type: "no_restock"
+      }));
+      const shipping = order.shipping_lines?.length > 0 ? {
+        full_refund: true
+      } : undefined;
+
+      const refundPayload = {
+        refund: {
+          notify: false,
+          note: reason,
+          refund_line_items: refundLineItems,
+          ...(shipping && { shipping })
+        }
+      };
+
+      const refundResult = await shopifyAPI(`orders/${orderId}/refunds.json`, "POST", refundPayload);
+      console.log(`Refund result:`, JSON.stringify(refundResult).substring(0, 300));
+    } catch (refundErr) {
+      console.log("Refund failed (non-critical):", refundErr.message);
+    }
+  }
+
+  console.log(`Cancelled order ${orderId}`);
 }
 
 app.post("/webhook/orders/create", async (req, res) => {
