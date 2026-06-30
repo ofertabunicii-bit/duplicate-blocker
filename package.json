@@ -1,0 +1,17 @@
+{
+  "name": "shopify-duplicate-order-blocker",
+  "version": "1.0.0",
+  "description": "Automatically cancels duplicate Shopify orders from the same customer within 72 hours",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "crypto": "^1.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
