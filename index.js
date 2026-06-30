@@ -39,12 +39,18 @@ function verifyWebhook(req) {
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac));
 }
 
-// Normalizeaza numarul de telefon - pastreaza doar ultimele 9 cifre
 function normalizePhone(phone) {
   if (!phone) return "";
-  const digits = phone.replace(/[^\d]/g, "");
-  // Pastreaza ultimele 9 cifre pentru comparatie (evita probleme cu prefixe)
-  return digits.slice(-9);
+  return phone.replace(/[^\d]/g, "").slice(-9);
+}
+
+async function shopifyAPIRaw(url) {
+  const res = await fetch(url, {
+    headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" },
+  });
+  const json = await res.json();
+  const linkHeader = res.headers.get("link") || "";
+  return { json, linkHeader };
 }
 
 async function shopifyAPI(path, method = "GET", body = null) {
@@ -58,32 +64,45 @@ async function shopifyAPI(path, method = "GET", body = null) {
   return res.json();
 }
 
+// Fetch ALL orders with pagination
+async function fetchAllOrders(since) {
+  const allOrders = [];
+  let url = `https://${SHOPIFY_STORE}/admin/api/2026-04/orders.json?status=any&created_at_min=${since}&limit=250&fields=id,name,phone,email,created_at,billing_address`;
+
+  while (url) {
+    const { json, linkHeader } = await shopifyAPIRaw(url);
+    if (json.orders) allOrders.push(...json.orders);
+
+    // Parse next page from Link header
+    const nextMatch = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
+    url = nextMatch ? nextMatch[1] : null;
+  }
+
+  return allOrders;
+}
+
 async function findRecentOrders(phone, email, currentOrderId) {
   const since = new Date(Date.now() - HOURS_LIMIT * 60 * 60 * 1000).toISOString();
   const found = [];
   const cleanPhone = normalizePhone(phone);
 
-  const data = await shopifyAPI(`orders.json?status=any&created_at_min=${since}&limit=250&fields=id,name,phone,email,created_at,billing_address`);
-  
-  if (data.orders) {
-    console.log(`Found ${data.orders.length} orders in last ${HOURS_LIMIT}h, looking for phone: ${cleanPhone}`);
-    for (const o of data.orders) {
-      if (String(o.id) === String(currentOrderId)) continue;
-      
-      const oPhone = normalizePhone(o.phone || o.billing_address?.phone || "");
-      
-      if (cleanPhone && oPhone && oPhone === cleanPhone) {
-        console.log(`MATCH: ${o.name} has same phone (${oPhone})`);
-        found.push(o);
-        continue;
-      }
-      if (email && o.email && o.email.toLowerCase() === email.toLowerCase()) {
-        console.log(`MATCH: ${o.name} has same email`);
-        found.push(o);
-      }
+  const orders = await fetchAllOrders(since);
+  console.log(`Found ${orders.length} orders in last ${HOURS_LIMIT}h, looking for phone: ${cleanPhone}`);
+
+  for (const o of orders) {
+    if (String(o.id) === String(currentOrderId)) continue;
+
+    const oPhone = normalizePhone(o.phone || o.billing_address?.phone || "");
+
+    if (cleanPhone && oPhone && oPhone === cleanPhone) {
+      console.log(`MATCH: ${o.name} has same phone (${oPhone})`);
+      found.push(o);
+      continue;
     }
-  } else {
-    console.log("API error:", JSON.stringify(data).substring(0, 300));
+    if (email && o.email && o.email.toLowerCase() === email.toLowerCase()) {
+      console.log(`MATCH: ${o.name} has same email`);
+      found.push(o);
+    }
   }
 
   return found;
