@@ -67,7 +67,7 @@ async function shopifyAPI(path, method = "GET", body = null) {
 // Fetch ALL orders with pagination
 async function fetchAllOrders(since) {
   const allOrders = [];
-  let url = `https://${SHOPIFY_STORE}/admin/api/2026-04/orders.json?status=any&created_at_min=${since}&limit=250&fields=id,name,phone,email,created_at,billing_address`;
+  let url = `https://${SHOPIFY_STORE}/admin/api/2026-04/orders.json?status=any&created_at_min=${since}&limit=250&fields=id,name,phone,email,created_at,billing_address,cancelled_at,cancel_reason`;
 
   while (url) {
     const { json, linkHeader } = await shopifyAPIRaw(url);
@@ -91,6 +91,7 @@ async function findRecentOrders(phone, email, currentOrderId) {
 
   for (const o of orders) {
     if (String(o.id) === String(currentOrderId)) continue;
+      if (o.cancel_reason || o.cancelled_at) continue; // ignora comenzile anulate
 
     const oPhone = normalizePhone(o.phone || o.billing_address?.phone || "");
 
