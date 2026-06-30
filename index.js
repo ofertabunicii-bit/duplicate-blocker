@@ -39,6 +39,14 @@ function verifyWebhook(req) {
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac));
 }
 
+// Normalizeaza numarul de telefon - pastreaza doar ultimele 9 cifre
+function normalizePhone(phone) {
+  if (!phone) return "";
+  const digits = phone.replace(/[^\d]/g, "");
+  // Pastreaza ultimele 9 cifre pentru comparatie (evita probleme cu prefixe)
+  return digits.slice(-9);
+}
+
 async function shopifyAPI(path, method = "GET", body = null) {
   const url = `https://${SHOPIFY_STORE}/admin/api/2026-04/${path}`;
   const opts = {
@@ -53,24 +61,26 @@ async function shopifyAPI(path, method = "GET", body = null) {
 async function findRecentOrders(phone, email, currentOrderId) {
   const since = new Date(Date.now() - HOURS_LIMIT * 60 * 60 * 1000).toISOString();
   const found = [];
-  const cleanPhone = phone ? phone.replace(/\s+/g, "").replace(/[^\d+]/g, "") : "";
+  const cleanPhone = normalizePhone(phone);
 
   const data = await shopifyAPI(`orders.json?status=any&created_at_min=${since}&limit=250&fields=id,name,phone,email,created_at,billing_address`);
   
   if (data.orders) {
-    console.log(`Found ${data.orders.length} orders in last ${HOURS_LIMIT}h`);
+    console.log(`Found ${data.orders.length} orders in last ${HOURS_LIMIT}h, looking for phone: ${cleanPhone}`);
     for (const o of data.orders) {
       if (String(o.id) === String(currentOrderId)) continue;
       
-      // Check phone from multiple sources
-      const oPhone1 = (o.phone || "").replace(/\s+/g, "").replace(/[^\d+]/g, "");
-      const oPhone2 = (o.billing_address?.phone || "").replace(/\s+/g, "").replace(/[^\d+]/g, "");
-      const oPhone = oPhone1 || oPhone2;
+      const oPhone = normalizePhone(o.phone || o.billing_address?.phone || "");
       
-      console.log(`Order ${o.name}: phone=${oPhone}, billing_phone=${oPhone2}, looking for=${cleanPhone}`);
-      
-      if (cleanPhone && oPhone && oPhone === cleanPhone) { found.push(o); continue; }
-      if (email && o.email && o.email.toLowerCase() === email.toLowerCase()) found.push(o);
+      if (cleanPhone && oPhone && oPhone === cleanPhone) {
+        console.log(`MATCH: ${o.name} has same phone (${oPhone})`);
+        found.push(o);
+        continue;
+      }
+      if (email && o.email && o.email.toLowerCase() === email.toLowerCase()) {
+        console.log(`MATCH: ${o.name} has same email`);
+        found.push(o);
+      }
     }
   } else {
     console.log("API error:", JSON.stringify(data).substring(0, 300));
