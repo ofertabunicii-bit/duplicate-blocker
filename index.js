@@ -13,32 +13,25 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 
-// ── Auth callback - obtine access token real ─────────────────────────────────
 app.get("/auth/callback", async (req, res) => {
   const { code, shop } = req.query;
   if (!code || !shop) return res.send("Missing code or shop");
-
   try {
     const response = await fetch(`https://${shop}/admin/oauth/access_token`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        client_id: SHOPIFY_CLIENT_ID,
-        client_secret: SHOPIFY_CLIENT_SECRET,
-        code,
-      }),
+      body: JSON.stringify({ client_id: SHOPIFY_CLIENT_ID, client_secret: SHOPIFY_CLIENT_SECRET, code }),
     });
     const data = await response.json();
     console.log("=== ACCESS TOKEN OBTINUT ===");
     console.log("access_token:", data.access_token);
     console.log("============================");
-    res.send(`<h1>Token obtinut!</h1><p>Copiaza acest token din logurile Render si pune-l ca SHOPIFY_TOKEN</p><pre>${JSON.stringify(data, null, 2)}</pre>`);
+    res.send(`<h1>Token obtinut!</h1><pre>${JSON.stringify(data, null, 2)}</pre>`);
   } catch (err) {
     res.send("Eroare: " + err.message);
   }
 });
 
-// ── Verify webhook ───────────────────────────────────────────────────────────
 function verifyWebhook(req) {
   const hmac = req.headers["x-shopify-hmac-sha256"];
   if (!hmac || !WEBHOOK_SECRET) return false;
@@ -46,34 +39,36 @@ function verifyWebhook(req) {
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac));
 }
 
-// ── REST API helper ──────────────────────────────────────────────────────────
 async function shopifyAPI(path, method = "GET", body = null) {
   const url = `https://${SHOPIFY_STORE}/admin/api/2026-04/${path}`;
   const opts = {
     method,
-    headers: {
-      "X-Shopify-Access-Token": SHOPIFY_TOKEN,
-      "Content-Type": "application/json",
-    },
+    headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" },
   };
   if (body) opts.body = JSON.stringify(body);
   const res = await fetch(url, opts);
   return res.json();
 }
 
-// ── Find duplicate orders ────────────────────────────────────────────────────
 async function findRecentOrders(phone, email, currentOrderId) {
   const since = new Date(Date.now() - HOURS_LIMIT * 60 * 60 * 1000).toISOString();
   const found = [];
   const cleanPhone = phone ? phone.replace(/\s+/g, "").replace(/[^\d+]/g, "") : "";
 
-  const data = await shopifyAPI(`orders.json?status=any&created_at_min=${since}&limit=250&fields=id,name,phone,email,created_at`);
-  console.log("API response keys:", Object.keys(data));
-
+  const data = await shopifyAPI(`orders.json?status=any&created_at_min=${since}&limit=250&fields=id,name,phone,email,created_at,billing_address`);
+  
   if (data.orders) {
+    console.log(`Found ${data.orders.length} orders in last ${HOURS_LIMIT}h`);
     for (const o of data.orders) {
       if (String(o.id) === String(currentOrderId)) continue;
-      const oPhone = (o.phone || "").replace(/\s+/g, "").replace(/[^\d+]/g, "");
+      
+      // Check phone from multiple sources
+      const oPhone1 = (o.phone || "").replace(/\s+/g, "").replace(/[^\d+]/g, "");
+      const oPhone2 = (o.billing_address?.phone || "").replace(/\s+/g, "").replace(/[^\d+]/g, "");
+      const oPhone = oPhone1 || oPhone2;
+      
+      console.log(`Order ${o.name}: phone=${oPhone}, billing_phone=${oPhone2}, looking for=${cleanPhone}`);
+      
       if (cleanPhone && oPhone && oPhone === cleanPhone) { found.push(o); continue; }
       if (email && o.email && o.email.toLowerCase() === email.toLowerCase()) found.push(o);
     }
@@ -84,14 +79,12 @@ async function findRecentOrders(phone, email, currentOrderId) {
   return found;
 }
 
-// ── Cancel order ─────────────────────────────────────────────────────────────
 async function cancelOrder(orderId, reason) {
   await shopifyAPI(`orders/${orderId}.json`, "PUT", { order: { id: orderId, note: reason } });
   const result = await shopifyAPI(`orders/${orderId}/cancel.json`, "POST", { reason: "other", email: false, restock: true });
   console.log(`Cancelled order ${orderId}:`, JSON.stringify(result).substring(0, 200));
 }
 
-// ── Webhook ──────────────────────────────────────────────────────────────────
 app.post("/webhook/orders/create", async (req, res) => {
   if (!verifyWebhook(req)) return res.status(401).send("Unauthorized");
   res.status(200).send("OK");
