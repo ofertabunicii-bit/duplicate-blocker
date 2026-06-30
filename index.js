@@ -110,8 +110,35 @@ async function findRecentOrders(phone, email, currentOrderId) {
 }
 
 async function cancelOrder(orderId, reason) {
+  // Adauga nota
   await shopifyAPI(`orders/${orderId}.json`, "PUT", { order: { id: orderId, note: reason } });
-  const result = await shopifyAPI(`orders/${orderId}/cancel.json`, "POST", { reason: "other", email: false, restock: true, refund: true });
+
+  // Editeaza comanda sa scoata produsele (Total = 0)
+  try {
+    const editStart = await shopifyAPI(`orders/${orderId}/edits.json`, "POST", {});
+    const calculatedOrderId = editStart?.calculated_order?.id;
+    if (calculatedOrderId) {
+      // Obtine linia items din comanda originala
+      const orderData = await shopifyAPI(`orders/${orderId}.json`);
+      const lineItems = orderData?.order?.line_items || [];
+      for (const item of lineItems) {
+        await shopifyAPI(`orders/${orderId}/edits/${calculatedOrderId}/line_items/${item.id}.json`, "DELETE", null);
+      }
+      await shopifyAPI(`orders/${orderId}/edits/${calculatedOrderId}/commit.json`, "POST", {
+        notify_customer: false,
+        reason: reason
+      });
+    }
+  } catch (editErr) {
+    console.log("Edit order failed (non-critical):", editErr.message);
+  }
+
+  // Anuleaza comanda
+  const result = await shopifyAPI(`orders/${orderId}/cancel.json`, "POST", { 
+    reason: "other", 
+    email: false, 
+    restock: true
+  });
   console.log(`Cancelled order ${orderId}:`, JSON.stringify(result).substring(0, 200));
 }
 
