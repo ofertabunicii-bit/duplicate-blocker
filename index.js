@@ -3,123 +3,97 @@ const crypto = require("crypto");
 
 const app = express();
 
-// ─── CONFIG ────────────────────────────────────────────────────────────────
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
 const SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
+const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
 const HOURS_LIMIT = parseInt(process.env.HOURS_LIMIT || "72");
 const PORT = process.env.PORT || 3000;
-// ────────────────────────────────────────────────────────────────────────────
 
 app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 
-// ── Verify Shopify webhook signature ────────────────────────────────────────
+// ── Auth callback - obtine access token real ─────────────────────────────────
+app.get("/auth/callback", async (req, res) => {
+  const { code, shop } = req.query;
+  if (!code || !shop) return res.send("Missing code or shop");
+
+  try {
+    const response = await fetch(`https://${shop}/admin/oauth/access_token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_id: SHOPIFY_CLIENT_ID,
+        client_secret: SHOPIFY_CLIENT_SECRET,
+        code,
+      }),
+    });
+    const data = await response.json();
+    console.log("=== ACCESS TOKEN OBTINUT ===");
+    console.log("access_token:", data.access_token);
+    console.log("============================");
+    res.send(`<h1>Token obtinut!</h1><p>Copiaza acest token din logurile Render si pune-l ca SHOPIFY_TOKEN</p><pre>${JSON.stringify(data, null, 2)}</pre>`);
+  } catch (err) {
+    res.send("Eroare: " + err.message);
+  }
+});
+
+// ── Verify webhook ───────────────────────────────────────────────────────────
 function verifyWebhook(req) {
   const hmac = req.headers["x-shopify-hmac-sha256"];
   if (!hmac || !WEBHOOK_SECRET) return false;
-  const digest = crypto
-    .createHmac("sha256", WEBHOOK_SECRET)
-    .update(req.rawBody)
-    .digest("base64");
+  const digest = crypto.createHmac("sha256", WEBHOOK_SECRET).update(req.rawBody).digest("base64");
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac));
 }
 
-// ── Shopify GraphQL helper ───────────────────────────────────────────────────
-async function shopifyGraphQL(query, variables = {}) {
-  const url = `https://${SHOPIFY_STORE}/admin/api/2026-04/graphql.json`;
-  const res = await fetch(url, {
-    method: "POST",
+// ── REST API helper ──────────────────────────────────────────────────────────
+async function shopifyAPI(path, method = "GET", body = null) {
+  const url = `https://${SHOPIFY_STORE}/admin/api/2026-04/${path}`;
+  const opts = {
+    method,
     headers: {
       "X-Shopify-Access-Token": SHOPIFY_TOKEN,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ query, variables }),
-  });
+  };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(url, opts);
   return res.json();
 }
 
-// ── Check for previous orders in last N hours ────────────────────────────────
+// ── Find duplicate orders ────────────────────────────────────────────────────
 async function findRecentOrders(phone, email, currentOrderId) {
   const since = new Date(Date.now() - HOURS_LIMIT * 60 * 60 * 1000).toISOString();
   const found = [];
-
   const cleanPhone = phone ? phone.replace(/\s+/g, "").replace(/[^\d+]/g, "") : "";
 
-  let queryStr = `created_at:>='${since}'`;
-  if (cleanPhone) queryStr += ` phone:${cleanPhone}`;
-  else if (email) queryStr += ` email:${email}`;
+  const data = await shopifyAPI(`orders.json?status=any&created_at_min=${since}&limit=250&fields=id,name,phone,email,created_at`);
+  console.log("API response keys:", Object.keys(data));
 
-  const gql = `
-    query($q: String!) {
-      orders(first: 20, query: $q) {
-        edges {
-          node {
-            id
-            name
-            phone
-            email
-            createdAt
-          }
-        }
-      }
+  if (data.orders) {
+    for (const o of data.orders) {
+      if (String(o.id) === String(currentOrderId)) continue;
+      const oPhone = (o.phone || "").replace(/\s+/g, "").replace(/[^\d+]/g, "");
+      if (cleanPhone && oPhone && oPhone === cleanPhone) { found.push(o); continue; }
+      if (email && o.email && o.email.toLowerCase() === email.toLowerCase()) found.push(o);
     }
-  `;
-
-  const data = await shopifyGraphQL(gql, { q: queryStr });
-  console.log("GraphQL response:", JSON.stringify(data).substring(0, 500));
-
-  if (data?.data?.orders?.edges) {
-    for (const { node } of data.data.orders.edges) {
-      const nodeId = node.id.split("/").pop();
-      if (String(nodeId) === String(currentOrderId)) continue;
-
-      if (cleanPhone) {
-        const oPhone = (node.phone || "").replace(/\s+/g, "").replace(/[^\d+]/g, "");
-        if (oPhone && oPhone === cleanPhone) found.push(node);
-      } else if (email && node.email === email) {
-        found.push(node);
-      }
-    }
+  } else {
+    console.log("API error:", JSON.stringify(data).substring(0, 300));
   }
 
   return found;
 }
 
-// ── Cancel an order ──────────────────────────────────────────────────────────
+// ── Cancel order ─────────────────────────────────────────────────────────────
 async function cancelOrder(orderId, reason) {
-  const gql = `
-    mutation cancelOrder($orderId: ID!, $reason: OrderCancelReason!, $notifyCustomer: Boolean!, $refund: Boolean!, $restock: Boolean!) {
-      orderCancel(orderId: $orderId, reason: $reason, notifyCustomer: $notifyCustomer, refund: $refund, restock: $restock) {
-        job {
-          id
-        }
-        orderCancelUserErrors {
-          message
-        }
-      }
-    }
-  `;
-
-  const gid = `gid://shopify/Order/${orderId}`;
-  const result = await shopifyGraphQL(gql, {
-    orderId: gid,
-    reason: "OTHER",
-    notifyCustomer: false,
-    refund: false,
-    restock: true,
-  });
-
-  console.log("Cancel result:", JSON.stringify(result).substring(0, 300));
-  console.log(`[${new Date().toISOString()}] Cancelled order ${orderId}: ${reason}`);
+  await shopifyAPI(`orders/${orderId}.json`, "PUT", { order: { id: orderId, note: reason } });
+  const result = await shopifyAPI(`orders/${orderId}/cancel.json`, "POST", { reason: "other", email: false, restock: true });
+  console.log(`Cancelled order ${orderId}:`, JSON.stringify(result).substring(0, 200));
 }
 
-// ── Webhook endpoint ─────────────────────────────────────────────────────────
+// ── Webhook ──────────────────────────────────────────────────────────────────
 app.post("/webhook/orders/create", async (req, res) => {
-  if (!verifyWebhook(req)) {
-    console.warn("Invalid webhook signature");
-    return res.status(401).send("Unauthorized");
-  }
-
+  if (!verifyWebhook(req)) return res.status(401).send("Unauthorized");
   res.status(200).send("OK");
 
   const order = req.body;
@@ -132,29 +106,20 @@ app.post("/webhook/orders/create", async (req, res) => {
 
   try {
     const duplicates = await findRecentOrders(phone, email, orderId);
-
     if (duplicates.length > 0) {
       const dupNames = duplicates.map((o) => o.name).join(", ");
-      const reason = `Comanda duplicata anulata automat. Comanda anterioara in ultimele ${HOURS_LIMIT}h: ${dupNames}`;
-      console.log(`Duplicate found for order ${orderName}: ${dupNames}`);
+      const reason = `Comanda duplicata anulata automat. Comanda anterioara: ${dupNames}`;
+      console.log(`DUPLICATE found for ${orderName}: ${dupNames}`);
       await cancelOrder(orderId, reason);
     } else {
       console.log(`Order ${orderName} is unique. No action taken.`);
     }
   } catch (err) {
-    console.error(`Error processing order ${orderName}:`, err);
+    console.error(`Error:`, err);
   }
 });
 
-// ── Health check ─────────────────────────────────────────────────────────────
-app.get("/", (req, res) => {
-  res.json({
-    status: "running",
-    store: SHOPIFY_STORE,
-    hours_limit: HOURS_LIMIT,
-    message: `Blocking duplicate orders within ${HOURS_LIMIT} hours`,
-  });
-});
+app.get("/", (req, res) => res.json({ status: "running", store: SHOPIFY_STORE, hours_limit: HOURS_LIMIT }));
 
 app.listen(PORT, () => {
   console.log(`Shopify Duplicate Order Blocker running on port ${PORT}`);
