@@ -284,3 +284,56 @@ app.post("/webhook/fulfillments/update", async (req, res) => {
     }
   }
 });
+
+// ── Endpoint fix retroactiv not delivered 90 zile ────────────────────────────
+app.get("/fix-not-delivered", async (req, res) => {
+  const secret = req.query.secret;
+  if (secret !== "bunero2026fix") return res.status(401).send("Unauthorized");
+
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.write("Caut comenzi not delivered din ultimele 90 de zile...\n\n");
+
+  try {
+    const since = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
+
+    // Fetch toate comenzile fulfillate din ultimele 90 zile
+    let url = `https://${SHOPIFY_STORE}/admin/api/2026-04/orders.json?status=any&fulfillment_status=fulfilled&created_at_min=${since}&limit=250&fields=id,name,total_price,line_items,shipping_lines,fulfillments,cancelled_at`;
+    const allOrders = [];
+
+    while (url) {
+      const r = await fetch(url, { headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN } });
+      const json = await r.json();
+      if (json.orders) allOrders.push(...json.orders);
+      const link = r.headers.get("link") || "";
+      const next = link.match(/<([^>]+)>;\s*rel="next"/);
+      url = next ? next[1] : null;
+    }
+
+    // Filtreaza doar cele cu shipment_status failure/not_delivered si necancelled
+    const notDelivered = allOrders.filter(o => {
+      if (o.cancelled_at) return false;
+      return o.fulfillments?.some(f => 
+        ["failure", "returned", "not_delivered"].includes(f.shipment_status)
+      );
+    });
+
+    res.write(`Gasit ${allOrders.length} comenzi fulfillate, ${notDelivered.length} not delivered\n\n`);
+
+    for (const order of notDelivered) {
+      try {
+        const reason = `Comanda anulata automat retroactiv - colet nelivrat`;
+        await cancelOrder(order.id, reason);
+        res.write(`✓ ${order.name} anulat si zerorizat\n`);
+      } catch (err) {
+        res.write(`✗ ${order.name} eroare: ${err.message}\n`);
+      }
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    res.write("\nGata!");
+    res.end();
+  } catch (err) {
+    res.write("Eroare generala: " + err.message);
+    res.end();
+  }
+});
