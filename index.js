@@ -258,6 +258,17 @@ app.get("/fix-cancelled-today", async (req, res) => {
   }
 });
 
+// ── Cancel order fara zerorizare (pentru comenzi nelivrate) ──────────────────
+async function cancelOrderOnly(orderId, reason) {
+  await shopifyAPI(`orders/${orderId}.json`, "PUT", { order: { id: orderId, note: reason } });
+  const result = await shopifyAPI(`orders/${orderId}/cancel.json`, "POST", { 
+    reason: "other", 
+    email: false, 
+    restock: true
+  });
+  console.log(`Cancelled order ${orderId} (no refund):`, JSON.stringify(result).substring(0, 200));
+}
+
 // ── Webhook fulfillment update - anuleaza comenzile "not delivered" ───────────
 app.post("/webhook/fulfillments/update", async (req, res) => {
   if (!verifyWebhook(req)) return res.status(401).send("Unauthorized");
@@ -277,7 +288,7 @@ app.post("/webhook/fulfillments/update", async (req, res) => {
     console.log(`Order ${orderId} marked as ${shipmentStatus} - anulare automata...`);
     try {
       const reason = `Comanda anulata automat - colet nelivrat (status: ${shipmentStatus})`;
-      await cancelOrder(orderId, reason);
+      await cancelOrderOnly(orderId, reason);
       console.log(`Order ${orderId} anulat cu succes.`);
     } catch (err) {
       console.error(`Eroare la anularea comenzii ${orderId}:`, err);
@@ -322,7 +333,7 @@ app.get("/fix-not-delivered", async (req, res) => {
     for (const order of notDelivered) {
       try {
         const reason = `Comanda anulata automat retroactiv - colet nelivrat`;
-        await cancelOrder(order.id, reason);
+        await cancelOrderOnly(order.id, reason);
         res.write(`✓ ${order.name} anulat si zerorizat\n`);
       } catch (err) {
         res.write(`✗ ${order.name} eroare: ${err.message}\n`);
