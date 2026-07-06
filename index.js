@@ -257,3 +257,30 @@ app.get("/fix-cancelled-today", async (req, res) => {
     res.end();
   }
 });
+
+// ── Webhook fulfillment update - anuleaza comenzile "not delivered" ───────────
+app.post("/webhook/fulfillments/update", async (req, res) => {
+  if (!verifyWebhook(req)) return res.status(401).send("Unauthorized");
+  res.status(200).send("OK");
+
+  const fulfillment = req.body;
+  const shipmentStatus = fulfillment.shipment_status;
+  const orderId = fulfillment.order_id;
+  const fulfillmentName = fulfillment.name || fulfillment.id;
+
+  console.log(`[${new Date().toISOString()}] Fulfillment update: ${fulfillmentName}, shipment_status: ${shipmentStatus}, order_id: ${orderId}`);
+
+  // Statusuri care indica colet nelivrat/refuzat
+  const notDeliveredStatuses = ["failure", "returned", "not_delivered"];
+
+  if (notDeliveredStatuses.includes(shipmentStatus)) {
+    console.log(`Order ${orderId} marked as ${shipmentStatus} - anulare automata...`);
+    try {
+      const reason = `Comanda anulata automat - colet nelivrat (status: ${shipmentStatus})`;
+      await cancelOrder(orderId, reason);
+      console.log(`Order ${orderId} anulat cu succes.`);
+    } catch (err) {
+      console.error(`Eroare la anularea comenzii ${orderId}:`, err);
+    }
+  }
+});
