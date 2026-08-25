@@ -105,6 +105,7 @@ async function findRecentOrders(phone, email, currentOrderId) {
 
   const orders = await fetchAllOrders(since);
   console.log(`Found ${orders.length} orders in last ${HOURS_LIMIT}h, looking for phone: ${cleanPhone}`);
+  if (orders.length > 0) console.log(`Sample order phones: ${orders.slice(0,3).map(o => o.phone || o.billing_address?.phone || "no-phone").join(", ")}`);
 
   for (const o of orders) {
     if (String(o.id) === String(currentOrderId)) continue;
