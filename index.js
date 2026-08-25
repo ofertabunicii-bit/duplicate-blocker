@@ -67,13 +67,12 @@ async function shopifyAPI(path, method = "GET", body = null) {
 // Fetch ALL orders with pagination
 async function fetchAllOrders(since) {
   const allOrders = [];
-  let url = `https://${SHOPIFY_STORE}/admin/api/2026-04/orders.json?status=any&created_at_min=${since}&limit=250&fields=id,name,phone,email,created_at,billing_address,cancelled_at,cancel_reason`;
+  let url = `https://${SHOPIFY_STORE}/admin/api/2026-04/orders.json?status=any&created_at_min=${since}&limit=250&fields=id,name,phone,email,created_at,billing_address,cancelled_at,cancel_reason,total_price,tags,fulfillment_status`;
 
   while (url) {
     const { json, linkHeader } = await shopifyAPIRaw(url);
     if (json.orders) allOrders.push(...json.orders);
 
-    // Parse next page from Link header
     const nextMatch = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
     url = nextMatch ? nextMatch[1] : null;
   }
@@ -91,7 +90,7 @@ async function findRecentOrders(phone, email, currentOrderId) {
 
   for (const o of orders) {
     if (String(o.id) === String(currentOrderId)) continue;
-      if (o.cancel_reason || o.cancelled_at) continue; // ignora comenzile anulate
+    if (o.cancel_reason || o.cancelled_at) continue; // ignora comenzile anulate
 
     const oPhone = normalizePhone(o.phone || o.billing_address?.phone || "");
 
@@ -164,16 +163,65 @@ app.post("/webhook/orders/create", async (req, res) => {
   const orderName = order.name;
   const phone = order.billing_address?.phone || order.phone || "";
   const email = order.email || "";
+  const orderTags = (order.tags || "").toLowerCase().split(",").map(t => t.trim());
 
-  console.log(`[${new Date().toISOString()}] New order ${orderName} — phone: ${phone}, email: ${email}`);
+  console.log(`[${new Date().toISOString()}] New order ${orderName} — phone: ${phone}, email: ${email}, tags: ${order.tags}`);
+
+  // ── MODIFICARE 2: Dacă comanda e marcată manual ca duplicată de admin, o ignorăm ──
+  if (orderTags.includes("duplicate") || orderTags.includes("duplicat") || orderTags.includes("duplicata")) {
+    console.log(`Order ${orderName} has duplicate tag set manually — skipping.`);
+    return;
+  }
 
   try {
     const duplicates = await findRecentOrders(phone, email, orderId);
+
     if (duplicates.length > 0) {
       const dupNames = duplicates.map((o) => o.name).join(", ");
-      const reason = `Comanda duplicata anulata automat. Comanda anterioara: ${dupNames}`;
-      console.log(`DUPLICATE found for ${orderName}: ${dupNames}`);
-      await cancelOrder(orderId, reason);
+
+      // ── Verifică dacă există duplicate deja fulfillate (trimise la curier) ──
+      const fulfilledDups = duplicates.filter(o => o.fulfillment_status === "fulfilled" || o.fulfillment_status === "partial");
+
+      if (fulfilledDups.length > 0) {
+        // Există o comandă anterioară deja trimisă la curier → anulăm întotdeauna noua comandă
+        const fulfilledNames = fulfilledDups.map(o => o.name).join(", ");
+        const reason = `Comanda duplicata anulata automat. Comanda anterioara deja expediata: ${fulfilledNames}`;
+        console.log(`OLD order ${fulfilledNames} already fulfilled — cancelling NEW order ${orderName}`);
+        await cancelOrder(orderId, reason);
+      } else {
+        // ── Nicio comandă anterioară nu e fulfillată → anulăm pe cea mai ieftină ──
+        const currentValue = parseFloat(order.total_price || "0");
+
+        // Găsește cea mai scumpă comandă anterioară
+        const mostExpensiveDup = duplicates.reduce((max, o) => {
+          const val = parseFloat(o.total_price || "0");
+          return val > parseFloat(max.total_price || "0") ? o : max;
+        }, duplicates[0]);
+
+        const dupValue = parseFloat(mostExpensiveDup.total_price || "0");
+
+        console.log(`DUPLICATE found for ${orderName} (${currentValue} lei) vs ${mostExpensiveDup.name} (${dupValue} lei)`);
+
+        if (currentValue >= dupValue) {
+          // Noua comandă e mai scumpă sau egală → anulăm comanda anterioară
+          const reason = `Comanda duplicata anulata automat. Comanda noua mai valoroasa: ${orderName} (${currentValue} lei)`;
+          console.log(`New order is >= in value — cancelling OLD order ${mostExpensiveDup.name}`);
+          await cancelOrder(mostExpensiveDup.id, reason);
+
+          // Dacă sunt mai multe duplicate, anulăm și pe celelalte
+          for (const dup of duplicates) {
+            if (String(dup.id) === String(mostExpensiveDup.id)) continue;
+            const r2 = `Comanda duplicata anulata automat. Comanda noua mai valoroasa: ${orderName}`;
+            await cancelOrder(dup.id, r2);
+          }
+        } else {
+          // Noua comandă e mai ieftină → anulăm noua comandă
+          const reason = `Comanda duplicata anulata automat. Comanda anterioara: ${dupNames}`;
+          console.log(`New order is cheaper — cancelling NEW order ${orderName}`);
+          await cancelOrder(orderId, reason);
+        }
+      }
+
     } else {
       console.log(`Order ${orderName} is unique. No action taken.`);
     }
@@ -281,7 +329,6 @@ app.post("/webhook/fulfillments/update", async (req, res) => {
 
   console.log(`[${new Date().toISOString()}] Fulfillment update: ${fulfillmentName}, shipment_status: ${shipmentStatus}, order_id: ${orderId}`);
 
-  // Statusuri care indica colet nelivrat/refuzat
   const notDeliveredStatuses = ["failure", "returned", "not_delivered"];
 
   if (notDeliveredStatuses.includes(shipmentStatus)) {
@@ -307,7 +354,6 @@ app.get("/fix-not-delivered", async (req, res) => {
   try {
     const since = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
 
-    // Fetch toate comenzile fulfillate din ultimele 90 zile
     let url = `https://${SHOPIFY_STORE}/admin/api/2026-04/orders.json?status=any&fulfillment_status=fulfilled&created_at_min=${since}&limit=250&fields=id,name,total_price,line_items,shipping_lines,fulfillments,cancelled_at`;
     const allOrders = [];
 
@@ -320,7 +366,6 @@ app.get("/fix-not-delivered", async (req, res) => {
       url = next ? next[1] : null;
     }
 
-    // Filtreaza doar cele cu shipment_status failure/not_delivered si necancelled
     const notDelivered = allOrders.filter(o => {
       if (o.cancelled_at) return false;
       return o.fulfillments?.some(f => 
@@ -334,7 +379,7 @@ app.get("/fix-not-delivered", async (req, res) => {
       try {
         const reason = `Comanda anulata automat retroactiv - colet nelivrat`;
         await cancelOrderOnly(order.id, reason);
-        res.write(`✓ ${order.name} anulat si zerorizat\n`);
+        res.write(`✓ ${order.name} anulat\n`);
       } catch (err) {
         res.write(`✗ ${order.name} eroare: ${err.message}\n`);
       }
