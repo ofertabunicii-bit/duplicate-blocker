@@ -67,7 +67,7 @@ async function shopifyAPI(path, method = "GET", body = null) {
 // Fetch ALL orders with pagination
 async function fetchAllOrders(since) {
   const allOrders = [];
-  let url = `https://${SHOPIFY_STORE}/admin/api/2026-04/orders.json?status=any&created_at_min=${since}&limit=250&fields=id,name,phone,email,created_at,billing_address,cancelled_at,cancel_reason,total_price,tags,fulfillment_status`;
+  let url = `https://${SHOPIFY_STORE}/admin/api/2026-04/orders.json?status=open&created_at_min=${since}&limit=250&fields=id,name,phone,email,created_at,billing_address,cancelled_at,cancel_reason,total_price,tags,fulfillment_status`;
 
   while (url) {
     const { json, linkHeader } = await shopifyAPIRaw(url);
@@ -166,6 +166,9 @@ app.post("/webhook/orders/create", async (req, res) => {
   const orderTags = (order.tags || "").toLowerCase().split(",").map(t => t.trim());
 
   console.log(`[${new Date().toISOString()}] New order ${orderName} — phone: ${phone}, email: ${email}, tags: ${order.tags}`);
+
+  // Delay 5 secunde ca sa fie sigur ca comanda e indexata in Shopify API
+  await new Promise(r => setTimeout(r, 5000));
 
   // ── MODIFICARE 2: Dacă comanda e marcată manual ca duplicată de admin, o ignorăm ──
   if (orderTags.includes("duplicate") || orderTags.includes("duplicat") || orderTags.includes("duplicata")) {
