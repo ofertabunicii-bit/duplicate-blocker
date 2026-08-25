@@ -67,14 +67,32 @@ async function shopifyAPI(path, method = "GET", body = null) {
 // Fetch ALL orders with pagination
 async function fetchAllOrders(since) {
   const allOrders = [];
-  let url = `https://${SHOPIFY_STORE}/admin/api/2026-04/orders.json?status=open&created_at_min=${since}&limit=250&fields=id,name,phone,email,created_at,billing_address,cancelled_at,cancel_reason,total_price,tags,fulfillment_status`;
+  const seenIds = new Set();
 
+  // Fetch comenzi open (normale)
+  let url = `https://${SHOPIFY_STORE}/admin/api/2026-04/orders.json?status=open&created_at_min=${since}&limit=250&fields=id,name,phone,email,created_at,billing_address,cancelled_at,cancel_reason,total_price,tags,fulfillment_status`;
   while (url) {
     const { json, linkHeader } = await shopifyAPIRaw(url);
-    if (json.orders) allOrders.push(...json.orders);
-
+    if (json.orders) {
+      for (const o of json.orders) {
+        if (!seenIds.has(o.id)) { seenIds.add(o.id); allOrders.push(o); }
+      }
+    }
     const nextMatch = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
     url = nextMatch ? nextMatch[1] : null;
+  }
+
+  // Fetch comenzi pending (COD neconfirmat)
+  let url2 = `https://${SHOPIFY_STORE}/admin/api/2026-04/orders.json?status=any&financial_status=pending&created_at_min=${since}&limit=250&fields=id,name,phone,email,created_at,billing_address,cancelled_at,cancel_reason,total_price,tags,fulfillment_status`;
+  while (url2) {
+    const { json, linkHeader } = await shopifyAPIRaw(url2);
+    if (json.orders) {
+      for (const o of json.orders) {
+        if (!seenIds.has(o.id)) { seenIds.add(o.id); allOrders.push(o); }
+      }
+    }
+    const nextMatch = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
+    url2 = nextMatch ? nextMatch[1] : null;
   }
 
   return allOrders;
